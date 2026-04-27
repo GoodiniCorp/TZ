@@ -1,0 +1,141 @@
+{
+  "name": "02 Job Poller",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "* * * * *"
+            }
+          ]
+        }
+      },
+      "id": "af384976-60fe-4ae5-b7d4-ac05a72b9f10",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -736,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, external_id FROM jobs WHERE status = 'pending'",
+        "options": {}
+      },
+      "id": "d2df9db6-0ad8-4876-8f02-f47c62154c3a",
+      "name": "Get Pending Jobs",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        144,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.example.com/jobs/{{ $json.external_id }}/status",
+        "options": {}
+      },
+      "id": "9836f612-d3cf-4729-ae0c-2844dce8b121",
+      "name": "Check External Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        368,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const status = $json.status || 'pending';\nconst id = $('Get Pending Jobs').first().json.id;\nreturn [{ json: { id, new_status: status } }];"
+      },
+      "id": "944de022-9bfa-4153-b6a6-361600ab7404",
+      "name": "Map Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        592,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status = '{{ $json.new_status }}', last_checked_at = NOW() WHERE id = '{{ $json.id }}'",
+        "options": {}
+      },
+      "id": "7e67ebfd-14ce-42eb-80fd-457dcf126aa0",
+      "name": "Update Job",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        1472,
+        0
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Pending Jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Pending Jobs": {
+      "main": [
+        [
+          {
+            "node": "Check External Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check External Status": {
+      "main": [
+        [
+          {
+            "node": "Map Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map Status": {
+      "main": [
+        [
+          {
+            "node": "Update Job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "6171e8d8-efe5-42c8-ae90-5273e4689e5b",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "db57106b4a771a7fbc5e46a5ac3db767f46156e00ecd689ae3528d3bb11bcb19"
+  },
+  "id": "W7WLooYGZagBt7Xr",
+  "tags": []
+}

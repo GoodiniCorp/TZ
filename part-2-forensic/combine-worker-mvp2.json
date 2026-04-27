@@ -1,0 +1,1053 @@
+{
+  "name": "Combine Worker - MVP2.0",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "8a7ec5c2-feee-44e9-9de9-62862bc784a1",
+      "name": "Poll Every Minute",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -3888,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Conditional dequeue: skip jobs still waiting on async music / voice / avatar generation.\n-- Pick iff:\n--   (music_enabled=false OR music_url ready)\n--   AND (voice_enabled=false OR voice_audio_url ready)\n--   AND (avatar_enabled=false OR avatar_url ready)          -- avatar pipeline: Kling + matting done\n--   OR queued > 45 minutes (timeout override — larger than before because avatar legitimately takes ~30 min)\n-- progress = GREATEST(progress, 75): never downgrade if Avatar Video already left us at 70+.\nUPDATE jobs\nSET status = 'processing', started_at = NOW(), progress = GREATEST(progress, 75)\nWHERE id = (\n  SELECT id FROM jobs\n  WHERE status = 'queued'\n    AND (\n      (\n        (music_enabled = false OR music_url IS NOT NULL)\n        AND\n        (voice_enabled = false OR voice_audio_url IS NOT NULL)\n        AND\n        (avatar_enabled = false OR avatar_url IS NOT NULL)\n      )\n      OR created_at < NOW() - INTERVAL '45 minutes'\n    )\n  ORDER BY created_at\n  FOR UPDATE SKIP LOCKED\n  LIMIT 1\n)\nRETURNING id::text AS job_id, user_id::text AS user_id, title, items::text AS items_json, music_enabled, music_url, voice_enabled, voice_audio_url, avatar_enabled, avatar_url, aspect_ratio",
+        "options": {}
+      },
+      "id": "c91df2bf-38bb-47ad-8307-dde031b6a26b",
+      "name": "Atomic Dequeue",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -2768,
+        96
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "check-job",
+              "leftValue": "={{ $json.job_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "exists"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "77526eb7-0d4a-4b3d-b514-0de096dcd55b",
+      "name": "Got Job?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -2528,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Plan builder — emits every shell command for this job.\n//\n// Pipeline stages:\n//   1. Download clips — always.\n//   2. Download music + voice + avatar — only when respective toggle ON and URL ready.\n//  *3. Normalize clips → uniform profile → concat demuxer → silent.mp4 (video + silent AAC).\n//   4. Mix — one of 4 scenarios (none / music-only / voice-only / both), all with fade-outs.\n//   5. Avatar overlay (optional) — chromakey greenscreen + overlay onto base video.\n//      ffmpeg flags copied VERBATIM from CFTG/Combine - 9.json lines ~70-76: chromakey=0x79ff9b:0.12:0.05,\n//      despill=type=green:mix=0.5, scale=400:-2, overlay=W-w-40:H-h. Do NOT tune without a live test.\n//   6. Upload final.mp4 to MinIO.\n//\n// Fade-outs: music 1.5s tail (cinematic), voice 0.5s tail (graceful cut if overshoot).\nconst row = $json;\nlet items = [];\ntry { items = JSON.parse(row.items_json || '[]'); } catch (_) { items = []; }\nconst valid = items.filter(it => it && it.video_url && /^https?:\\/\\//.test(it.video_url));\n\nif (valid.length === 0) {\n  return [{ json: { valid: false, job_id: row.job_id, user_id: row.user_id, error: 'No clips with a usable video_url in this job.' } }];\n}\n\nconst jobId = row.job_id;\nconst tmpDir = `/tmp/goodini/${jobId}`;\nconst silentPath = `${tmpDir}/silent.mp4`;\nconst preOverlayPath = `${tmpDir}/with_audio.mp4`;\nconst outPath = `${tmpDir}/final.mp4`;\nconst musicPath = `${tmpDir}/music.mp3`;\nconst voicePath = `${tmpDir}/voice.mp3`;\nconst avatarPath = `${tmpDir}/avatar.mp4`;\n\nconst shq = (s) => `'${String(s).replace(/'/g, \"'\\\\''\")}'`;\n\nconst hasMusic = row.music_enabled === true && row.music_url && /^https?:\\/\\//.test(row.music_url);\nconst hasVoice = row.voice_enabled === true && row.voice_audio_url && /^https?:\\/\\//.test(row.voice_audio_url);\nconst hasAvatar = row.avatar_enabled === true && row.avatar_url && /^https?:\\/\\//.test(row.avatar_url);\n\n// Aspect ratio — single value per montage (frontend blocks mixing 16:9 + 9:16).\n// Drives output canvas size and avatar overlay scale. 16:9 → 1920x1080 + avatar 550.\n// 9:16 → 1080x1920 + avatar 450. Defaults to 16:9 if column is null (legacy rows).\nconst isPortrait = row.aspect_ratio === '9:16';\nconst OUT_W = isPortrait ? 1080 : 1920;\nconst OUT_H = isPortrait ? 1920 : 1080;\nconst AVATAR_SCALE = isPortrait ? 450 : 550;\n\n// When avatar is ON, mix output goes to with_audio.mp4 (intermediate), then overlay step produces final.mp4.\n// When avatar is OFF, mix output goes straight to final.mp4 (single-stage, as before).\nconst mixOutPath = hasAvatar ? preOverlayPath : outPath;\n\n// Stage 1 — parallel download (clips + optional music + optional voice + optional avatar).\nconst downloads = valid.map((it, i) =>\n  `curl -sfL --retry 3 --retry-delay 2 -o ${tmpDir}/clip${i}.mp4 ${shq(it.video_url)}`\n).join(' && ');\nconst prepareInner = `mkdir -p ${tmpDir} && ${downloads}`;\nconst downloadMusicInner = hasMusic\n  ? `curl -sfL --retry 3 --retry-delay 2 -o ${musicPath} ${shq(row.music_url)}`\n  : '';\nconst downloadVoiceInner = hasVoice\n  ? `curl -sfL --retry 3 --retry-delay 2 -o ${voicePath} ${shq(row.voice_audio_url)}`\n  : '';\nconst downloadAvatarInner = hasAvatar\n  ? `curl -sfL --retry 3 --retry-delay 2 -o ${avatarPath} ${shq(row.avatar_url)}`\n  : '';\n\n// Stage 2 — single-pass filter_complex concat. No per-clip normalize, no concat demuxer.\n// Reads raw source clips, re-encodes into one continuous timeline with libx264 + silent AAC.\n// This eliminates DTS discontinuities at clip boundaries that caused avatar overlay freezes.\nconst inputs = valid.map((_, i) => `-i ${tmpDir}/clip${i}.mp4`).join(' ');\nconst n = valid.length;\nconst vfChain = valid.map((_, i) =>\n  `[${i}:v]scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=decrease,pad=${OUT_W}:${OUT_H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p[v${i}]`\n).join(';');\nconst concatLabels = valid.map((_, i) => `[v${i}]`).join('');\nconst filterComplex = `${vfChain};${concatLabels}concat=n=${n}:v=1:a=0[vout]`;\nconst renderInner = [\n  '/usr/bin/ffmpeg -y -hide_banner -loglevel error',\n  inputs,\n  '-f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000',\n  `-filter_complex ${shq(filterComplex)}`,\n  '-map \"[vout]\" -map ' + n + ':a',\n  '-c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p',\n  '-c:a aac -b:a 192k -ar 48000 -ac 2',\n  '-shortest -movflags +faststart',\n  silentPath\n].join(' ');\nconst probeInner = `/usr/bin/ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${outPath}`;\n\n//*Stage 3 — mix. Four scenarios:\n//  A) no audio  → mv silent → final\n//  B) music only → amix(silent_audio, music w/ volume 0.3 + afade 1.5s tail)\n//  C) voice only → amix(silent_audio, voice w/ afade 0.5s tail)\n//  D) music + voice → amix(silent_audio, music 0.3 + fade, voice + fade)\n// FADE_M = max(0, duration - 1.5); FADE_V = max(0, duration - 0.5). Computed\n// via shell && chain (not variable-prefix syntax — siblings can't see each other).\nlet mixInner;\nif (!hasMusic && !hasVoice) {\n  mixInner = `mv ${silentPath} ${mixOutPath}`;\n} else if (hasMusic && !hasVoice) {\n  mixInner = [\n    `FADE_M=$(/usr/bin/ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${silentPath} | awk -F. '{f=$1-1.5; if(f<0) f=0; print f; exit}')`,\n    '&&',\n    '/usr/bin/ffmpeg -y -hide_banner -loglevel error',\n    `-i ${silentPath} -i ${musicPath}`,\n    '-filter_complex \"[1:a]volume=0.3,afade=t=out:st=$FADE_M:d=1.5[bg];[0:a][bg]amix=inputs=2:duration=first:normalize=0[mix]\"',\n    '-map 0:v -map \"[mix]\" -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart',\n    mixOutPath\n  ].join(' ');\n} else if (!hasMusic && hasVoice) {\n  // atempo auto-fit 2026-04-19: if voice.mp3 is longer than silent video, speed it\n  // up to fit. Clamp RATIO to [1.0, 1.10]. <1.0 = voice already shorter, leave alone.\n  // >1.10 = chipmunk territory, cap at 1.10 and let -shortest trim the residual tail.\n  mixInner = [\n    `VIDEO_DUR=$(/usr/bin/ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${silentPath})`,\n    '&&',\n    `VOICE_DUR=$(/usr/bin/ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${voicePath})`,\n    '&&',\n    'RATIO=$(awk \"BEGIN{r=$VOICE_DUR/$VIDEO_DUR; if(r<1.0) r=1.0; if(r>1.10) r=1.10; printf \\\\\"%.4f\\\\\", r}\")',\n    '&&',\n    'FADE_V=$(awk \"BEGIN{f=$VIDEO_DUR-0.5; if(f<0) f=0; printf \\\\\"%.3f\\\\\", f}\")',\n    '&&',\n    '/usr/bin/ffmpeg -y -hide_banner -loglevel error',\n    `-i ${silentPath} -i ${voicePath}`,\n    '-filter_complex \"[1:a]atempo=$RATIO,afade=t=out:st=$FADE_V:d=0.5[voice];[0:a][voice]amix=inputs=2:duration=first:normalize=0[mix]\"',\n    '-map 0:v -map \"[mix]\" -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart',\n    mixOutPath\n  ].join(' ');\n} else {\n  // atempo auto-fit applies only to voice. Music stays at its own tempo (artistic).\n  mixInner = [\n    `VIDEO_DUR=$(/usr/bin/ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${silentPath})`,\n    '&&',\n    `VOICE_DUR=$(/usr/bin/ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${voicePath})`,\n    '&&',\n    'RATIO=$(awk \"BEGIN{r=$VOICE_DUR/$VIDEO_DUR; if(r<1.0) r=1.0; if(r>1.10) r=1.10; printf \\\\\"%.4f\\\\\", r}\")',\n    '&&',\n    'FADE_M=$(awk \"BEGIN{f=$VIDEO_DUR-1.5; if(f<0) f=0; printf \\\\\"%.3f\\\\\", f}\")',\n    '&&',\n    'FADE_V=$(awk \"BEGIN{f=$VIDEO_DUR-0.5; if(f<0) f=0; printf \\\\\"%.3f\\\\\", f}\")',\n    '&&',\n    '/usr/bin/ffmpeg -y -hide_banner -loglevel error',\n    `-i ${silentPath} -i ${musicPath} -i ${voicePath}`,\n    '-filter_complex \"[1:a]volume=0.3,afade=t=out:st=$FADE_M:d=1.5[bg];[2:a]atempo=$RATIO,afade=t=out:st=$FADE_V:d=0.5[voice];[0:a][bg][voice]amix=inputs=3:duration=first:normalize=0[mix]\"',\n    '-map 0:v -map \"[mix]\" -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart',\n    mixOutPath\n  ].join(' ');\n}\n\n// Stage 5 (optional) — avatar chromakey overlay. VERBATIM from CFTG/Combine - 9.json:\n//   chromakey=0x79ff9b:0.12:0.05      — keys out the specific green Kling+matting produces\n//   despill=type=green:mix=0.5        — removes green fringing on hair/edges\n//   scale=400:-2                      — fixed agent width, auto-height preserving aspect (16:9 baseline)\n//   overlay=W-w-40:H-h                — bottom-right corner, 40px right margin, flush with bottom edge\n// ffmpeg re-encodes base (libx264 fast) because chromakey can't copy codec.\nlet overlayInner = '';\nif (hasAvatar) {\n  overlayInner = [\n    `FADE_START=$(/usr/bin/ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${avatarPath} | awk '{f=$1-0.5; if(f<0) f=0; print f; exit}')`,\n    '&&',\n    '/usr/bin/ffmpeg -y -hide_banner -loglevel error',\n    `-i ${preOverlayPath} -i ${avatarPath}`,\n    `-filter_complex \"[1:v]crop=iw*0.6:ih:iw*0.4:0,chromakey=0x79ff9b:0.10:0.05,despill=type=green:mix=0.5,scale=${AVATAR_SCALE}:-2,format=yuva420p,fade=t=out:st=\\$FADE_START:d=0.5:alpha=1[agent];[0:v]scale=iw*sar:ih,setsar=1[base];[base][agent]overlay=W-w-40:H-h:eof_action=pass[v]\"`,\n    '-map \"[v]\" -map 0:a -c:v libx264 -preset fast -c:a copy -movflags +faststart',\n    outPath\n  ].join(' ');\n}\n\nconst safeTitle = (row.title || 'montage').trim().replace(/[^\\p{L}\\p{N}_-]+/gu, '_').replace(/^_+|_+$/g, '').slice(0, 80) || 'montage';\nconst minioKey = `goodini-videos/${jobId}/${safeTitle}.mp4`;\nconst uploadInner = `mc cp --attr \"Content-Disposition=attachment\" ${outPath} minio/${minioKey} && (mc anonymous set download minio/goodini-videos >/dev/null 2>&1 || true)`;\nconst cleanupInner = `rm -rf ${tmpDir}`;\n\nconst docker = (inner) => `docker exec n8n-n8n-1 sh -c ${shq(inner)}`;\n\nreturn [{ json: {\n  valid: true,\n  job_id: jobId,\n  user_id: row.user_id,\n  title: row.title || 'Untitled montage',\n  clip_count: valid.length,\n  has_music: hasMusic,\n  has_voice: hasVoice,\n  has_avatar: hasAvatar,\n  tmp_dir: tmpDir,\n  silent_path: silentPath,\n  output_path: outPath,\n  minio_key: minioKey,\n  public_url: `https://s3.goodini.space/${minioKey}`,\n  cmd_prepare: docker(prepareInner),\n  cmd_ffmpeg: docker(renderInner),\n  cmd_probe: docker(probeInner),\n  cmd_download_music: downloadMusicInner ? docker(downloadMusicInner) : '',\n  cmd_download_voice: downloadVoiceInner ? docker(downloadVoiceInner) : '',\n  cmd_download_avatar: downloadAvatarInner ? docker(downloadAvatarInner) : '',\n  cmd_mix: docker(mixInner),\n  cmd_overlay: overlayInner ? docker(overlayInner) : '',\n  cmd_upload: docker(uploadInner),\n  cmd_cleanup: docker(cleanupInner)\n} }];"
+      },
+      "id": "a3389def-772d-44a4-8e65-cb26cd773092",
+      "name": "Build Plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2144,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "plan-ok",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "9da7ca24-1c4c-45ee-9418-7998c6b74f3d",
+      "name": "Plan OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1904,
+        -64
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status = 'error', error_message = '{{ $json.error.replace(/'/g, \"''\") }}', completed_at = NOW() WHERE id = '{{ $json.job_id }}'",
+        "options": {}
+      },
+      "id": "8a850f53-7bf7-4254-91da-65073b8aebb8",
+      "name": "Mark Invalid",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -1504,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.cmd_prepare }}"
+      },
+      "id": "74835208-f0a8-45f6-9c45-2a15dee21ef1",
+      "name": "SSH Download Clips",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        -1504,
+        -208
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $json;\nif (r.code !== 0) throw new Error(`Download failed (exit ${r.code}): ${r.stderr || r.stdout || 'no output'}`);\nreturn $input.all();"
+      },
+      "id": "c345d807-29e0-4e96-9fea-711dd4d70d0c",
+      "name": "Check Download",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1264,
+        -208
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET progress = GREATEST(progress, 80) WHERE id = '{{ $('Build Plan').first().json.job_id }}'",
+        "options": {}
+      },
+      "id": "f180ecfc-47a1-4371-a9c4-d2dc4ec2e017",
+      "name": "Progress 25",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -864,
+        -208
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ $('Build Plan').first().json.cmd_ffmpeg }}"
+      },
+      "id": "aa39651a-0560-4375-a9f6-e9ac75a0c4cb",
+      "name": "SSH ffmpeg Concat",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        -464,
+        -208
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $json;\nif (r.code !== 0) throw new Error(`FFmpeg concat failed (exit ${r.code}): ${r.stderr || r.stdout || 'no output'}`);\nreturn $input.all();"
+      },
+      "id": "8a590817-9dc5-4915-aab2-3ae4e377d752",
+      "name": "Check FFmpeg",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -224,
+        -208
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET progress = GREATEST(progress, 85) WHERE id = '{{ $('Build Plan').first().json.job_id }}'",
+        "options": {}
+      },
+      "id": "29dabb51-c2e2-4541-bfcb-d60b098d7c9b",
+      "name": "Progress 55",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        256,
+        -208
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "music-on",
+              "leftValue": "={{ $('Build Plan').first().json.cmd_download_music }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "9a22a557-48e9-4ee9-80ef-548adfa08d5f",
+      "name": "Need Music?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        800,
+        -208
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ $('Build Plan').first().json.cmd_download_music }}"
+      },
+      "id": "ba3c8a4f-032c-48e6-8145-0d1a85aef088",
+      "name": "SSH Download Music",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        1104,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $json;\nif (r.code !== 0) throw new Error(`Music download failed (exit ${r.code}): ${r.stderr || r.stdout || 'no output'}`);\nreturn $input.all();"
+      },
+      "id": "9581b9f4-d14d-4fbf-a349-734f93288b8c",
+      "name": "Check Music DL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "voice-on",
+              "leftValue": "={{ $('Build Plan').first().json.cmd_download_voice }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8f6ea9c5-3dba-4440-8356-c047b06e8a26",
+      "name": "Need Voice?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1600,
+        -192
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ $('Build Plan').first().json.cmd_download_voice }}"
+      },
+      "id": "19f098c0-71b6-472b-bebd-5f504db7708d",
+      "name": "SSH Download Voice",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        1952,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $json;\nif (r.code !== 0) throw new Error(`Voice download failed (exit ${r.code}): ${r.stderr || r.stdout || 'no output'}`);\nreturn $input.all();"
+      },
+      "id": "f5ad8ef9-4a80-4636-a7c1-84e5696a4a7e",
+      "name": "Check Voice DL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2176,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ $('Build Plan').first().json.cmd_mix }}"
+      },
+      "id": "968f440b-8cbd-4ce6-82e7-7fdec51f267b",
+      "name": "SSH Mix Audio",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        2448,
+        -176
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $json;\nif (r.code !== 0) throw new Error(`Audio mix failed (exit ${r.code}): ${r.stderr || r.stdout || 'no output'}`);\nreturn $input.all();"
+      },
+      "id": "69224f5a-2fd9-4859-9258-564c1d85a44c",
+      "name": "Check Mix",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2896,
+        -176
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET progress = GREATEST(progress, 90) WHERE id = '{{ $('Build Plan').first().json.job_id }}'",
+        "options": {}
+      },
+      "id": "7e0edc79-5197-4327-93e2-e7473750408c",
+      "name": "Progress 75",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3344,
+        -176
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "avatar-on",
+              "leftValue": "={{ $('Build Plan').first().json.has_avatar }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d3fc7f1c-96b5-4881-a560-937a46b359e0",
+      "name": "Need Avatar?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3584,
+        -176
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ $('Build Plan').first().json.cmd_download_avatar }}"
+      },
+      "id": "3d4949f2-6c3d-479a-86ae-c85d1d25d3fb",
+      "name": "SSH Download Avatar",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        3952,
+        -304
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $json;\nif (r.code !== 0) throw new Error(`Avatar download failed (exit ${r.code}): ${r.stderr || r.stdout || 'no output'}`);\nreturn $input.all();"
+      },
+      "id": "a429b8d6-1583-45df-99a1-4c23dd255c71",
+      "name": "Check Avatar DL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4192,
+        -304
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ $('Build Plan').first().json.cmd_overlay }}"
+      },
+      "id": "163c1bda-c8e0-4618-a1ea-9f6b85081dad",
+      "name": "SSH Avatar Overlay",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        4432,
+        -304
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $json;\nif (r.code !== 0) throw new Error(`Avatar overlay failed (exit ${r.code}): ${r.stderr || r.stdout || 'no output'}`);\nreturn $input.all();"
+      },
+      "id": "a3d55be8-4788-41c3-87cd-c08d390d721d",
+      "name": "Check Overlay",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4672,
+        -304
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET progress = GREATEST(progress, 95) WHERE id = '{{ $('Build Plan').first().json.job_id }}'",
+        "options": {}
+      },
+      "id": "9400e2e0-3047-40dc-88c9-2b2ff376681f",
+      "name": "Progress 95",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        4912,
+        -304
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Queued jobs waiting on async workers Music / Voice / Avatar IMG / Avatar Video.\nUPDATE jobs\nSET progress = GREATEST(progress, LEAST(progress + 1, 70))\nWHERE status = 'queued' AND progress < 70",
+        "options": {}
+      },
+      "id": "b7393aa8-c227-4e9d-a66d-28332ae7e026",
+      "name": "Nudge Queued Progress",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -1488,
+        832
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ $('Build Plan').first().json.cmd_probe }}"
+      },
+      "id": "a5e59e88-ff2d-496b-ad6c-005a82b77d0e",
+      "name": "SSH Probe Duration",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        5344,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $json;\nif (r.code !== 0) throw new Error(`ffprobe failed (exit ${r.code}): ${r.stderr || r.stdout || 'no output'}`);\nconst dur = parseFloat((r.stdout || '0').trim());\nif (!isFinite(dur) || dur <= 0) throw new Error(`ffprobe returned invalid duration: '${r.stdout}'`);\nreturn [{ json: { duration_seconds: Math.round(dur) } }];"
+      },
+      "id": "9375a687-0446-440a-a4ad-d9a4619e552c",
+      "name": "Check Probe",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5680,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ $('Build Plan').first().json.cmd_upload }}"
+      },
+      "id": "5cc4a60a-0d75-48d3-a398-f1d015b09a9b",
+      "name": "SSH Upload to MinIO",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        5920,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $json;\nif (r.code !== 0) throw new Error(`Upload failed (exit ${r.code}): ${r.stderr || r.stdout || 'no output'}`);\nconst out = r.stdout || '';\nif (/Total\\s*\\S*\\s*0\\s*B/i.test(out) && !/Transferred.*[1-9]/.test(out)) {\n  throw new Error(`Upload wrote 0 bytes — source file was probably missing. mc output:\\n${out}`);\n}\nreturn $input.all();"
+      },
+      "id": "f9313f46-7334-4ddf-a4f4-0663dc665d1b",
+      "name": "Check Upload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6160,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO videos (user_id, job_id, title, file_url, duration_seconds)\nVALUES (\n  '{{ $('Build Plan').first().json.user_id }}',\n  '{{ $('Build Plan').first().json.job_id }}',\n  '{{ $('Build Plan').first().json.title.replace(/'/g, \"''\") }}',\n  '{{ $('Build Plan').first().json.public_url }}',\n  {{ $('Check Probe').first().json.duration_seconds }}\n)\nRETURNING id::text",
+        "options": {}
+      },
+      "id": "c88dd8da-0673-43e2-aa6f-cfe5839d461f",
+      "name": "Insert Video",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        7024,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE jobs SET status = 'done', progress = GREATEST(progress, 100), completed_at = NOW() WHERE id = '{{ $('Build Plan').first().json.job_id }}'",
+        "options": {}
+      },
+      "id": "5978c23f-4f1c-4ed1-a469-31579e847523",
+      "name": "Mark Done",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        7264,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO user_notifications (user_id, level, title, body, related_job) VALUES ('{{ $('Build Plan').first().json.user_id }}', 'success', 'Your video is ready', 'Your montage finished rendering and is available in Ready Videos.', '{{ $('Build Plan').first().json.job_id }}')",
+        "options": {}
+      },
+      "id": "c33f2b2b-2768-4310-9966-969c92bddaa7",
+      "name": "Notify User Success",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        7504,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ $('Build Plan').first().json.cmd_cleanup }}"
+      },
+      "id": "072bd469-355b-4ed0-8fa1-d2e2b6734db1",
+      "name": "SSH Cleanup",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        8928,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "DELETE FROM videos WHERE job_id = 'c244c0ca-2360-4096-a443-181bd80725ee';\n\nUPDATE jobs\nSET status = 'queued',\n    progress = 70,\n    completed_at = NULL,\n    error_message = NULL\nWHERE id = 'c244c0ca-2360-4096-a443-181bd80725ee';",
+        "options": {}
+      },
+      "id": "27b94f30-a85b-4b32-aa3d-6414cd2d7700",
+      "name": "queued test for jobID",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -3888,
+        -80
+      ],
+      "alwaysOutputData": true
+    }
+  ],
+  "pinData": {
+    "Poll Every Minute": [
+      {
+        "json": {
+          "timestamp": "2026-04-18T04:04:25.002+03:00",
+          "Readable date": "April 18th 2026, 4:04:25 am",
+          "Readable time": "4:04:25 am",
+          "Day of week": "Saturday",
+          "Year": "2026",
+          "Month": "April",
+          "Day of month": "18",
+          "Hour": "04",
+          "Minute": "04",
+          "Second": "25",
+          "Timezone": "Europe/Moscow (UTC+03:00)"
+        },
+        "pairedItem": {
+          "item": 0
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Poll Every Minute": {
+      "main": [
+        [
+          {
+            "node": "Atomic Dequeue",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Nudge Queued Progress",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Atomic Dequeue": {
+      "main": [
+        [
+          {
+            "node": "Got Job?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Got Job?": {
+      "main": [
+        [
+          {
+            "node": "Build Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Plan": {
+      "main": [
+        [
+          {
+            "node": "Plan OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan OK?": {
+      "main": [
+        [
+          {
+            "node": "SSH Download Clips",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SSH Download Clips": {
+      "main": [
+        [
+          {
+            "node": "Check Download",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Download": {
+      "main": [
+        [
+          {
+            "node": "Progress 25",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Progress 25": {
+      "main": [
+        [
+          {
+            "node": "SSH ffmpeg Concat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SSH ffmpeg Concat": {
+      "main": [
+        [
+          {
+            "node": "Check FFmpeg",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check FFmpeg": {
+      "main": [
+        [
+          {
+            "node": "Progress 55",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Progress 55": {
+      "main": [
+        [
+          {
+            "node": "Need Music?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Need Music?": {
+      "main": [
+        [
+          {
+            "node": "SSH Download Music",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Need Voice?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SSH Download Music": {
+      "main": [
+        [
+          {
+            "node": "Check Music DL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Music DL": {
+      "main": [
+        [
+          {
+            "node": "Need Voice?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Need Voice?": {
+      "main": [
+        [
+          {
+            "node": "SSH Download Voice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "SSH Mix Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SSH Download Voice": {
+      "main": [
+        [
+          {
+            "node": "Check Voice DL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Voice DL": {
+      "main": [
+        [
+          {
+            "node": "SSH Mix Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SSH Mix Audio": {
+      "main": [
+        [
+          {
+            "node": "Check Mix",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Mix": {
+      "main": [
+        [
+          {
+            "node": "Progress 75",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Progress 75": {
+      "main": [
+        [
+          {
+            "node": "Need Avatar?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Need Avatar?": {
+      "main": [
+        [
+          {
+            "node": "SSH Download Avatar",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "SSH Probe Duration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SSH Download Avatar": {
+      "main": [
+        [
+          {
+            "node": "Check Avatar DL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Avatar DL": {
+      "main": [
+        [
+          {
+            "node": "SSH Avatar Overlay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SSH Avatar Overlay": {
+      "main": [
+        [
+          {
+            "node": "Check Overlay",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Overlay": {
+      "main": [
+        [
+          {
+            "node": "Progress 95",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Progress 95": {
+      "main": [
+        [
+          {
+            "node": "SSH Probe Duration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SSH Probe Duration": {
+      "main": [
+        [
+          {
+            "node": "Check Probe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Probe": {
+      "main": [
+        [
+          {
+            "node": "SSH Upload to MinIO",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SSH Upload to MinIO": {
+      "main": [
+        [
+          {
+            "node": "Check Upload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Upload": {
+      "main": [
+        [
+          {
+            "node": "Insert Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert Video": {
+      "main": [
+        [
+          {
+            "node": "Mark Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Done": {
+      "main": [
+        [
+          {
+            "node": "Notify User Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify User Success": {
+      "main": [
+        [
+          {
+            "node": "SSH Cleanup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "4e2f2046-f14d-4ff0-b2d4-84643f265c68",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "db57106b4a771a7fbc5e46a5ac3db767f46156e00ecd689ae3528d3bb11bcb19"
+  },
+  "id": "W7WLooYGZagBt7Xr",
+  "tags": []
+}

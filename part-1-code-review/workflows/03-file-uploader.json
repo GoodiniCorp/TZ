@@ -1,0 +1,144 @@
+{
+  "name": "03 File Uploader",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "upload",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "b6e46184-db35-4fac-8c21-a610cb39896a",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [
+        -1680,
+        -144
+      ],
+      "webhookId": "upload-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "const headers = $input.first().json.headers || {};\nconst sizeStr = headers['content-length'] || '0';\nconst sizeMb = parseInt(sizeStr, 10) / 1024 / 1024;\nconst MAX_MB = 10;\n\nif (sizeMb > MAX_MB) {\n  throw new Error(`File too large: ${sizeMb.toFixed(1)} MB > ${MAX_MB} MB`);\n}\n\nconst body = $input.first().json.body || {};\nconst filename = body.filename || 'untitled.bin';\nconst userId = body.user_id || null;\n\nreturn [{ json: { filename, user_id: userId, size_bytes: parseInt(sizeStr, 10) } }];"
+      },
+      "id": "00daa3f2-5930-477a-bb21-bedb51f65d31",
+      "name": "Check Size",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -720,
+        -144
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "upload",
+        "bucketName": "uploads",
+        "fileName": "=uploads/{{ $json.filename }}",
+        "additionalFields": {}
+      },
+      "id": "3783d793-2433-4ed1-87fd-1f3a000d61c7",
+      "name": "Upload to S3",
+      "type": "n8n-nodes-base.s3",
+      "typeVersion": 1,
+      "position": [
+        -512,
+        -144
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO files (user_id, filename, s3_key, size_bytes) VALUES ('{{ $('Check Size').first().json.user_id }}', '{{ $('Check Size').first().json.filename }}', 'uploads/{{ $('Check Size').first().json.filename }}', {{ $('Check Size').first().json.size_bytes }}) RETURNING id",
+        "options": {}
+      },
+      "id": "cd1de859-26d5-4745-ba3e-00be073a3090",
+      "name": "Save File Record",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        -288,
+        -144
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"success\": true, \"url\": \"http://localhost:9000/uploads/{{ $('Check Size').first().json.filename }}\" }",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "40992e4a-c9e9-4a0b-8ffa-74d557f8fce0",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        672,
+        -144
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Check Size",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Size": {
+      "main": [
+        [
+          {
+            "node": "Upload to S3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload to S3": {
+      "main": [
+        [
+          {
+            "node": "Save File Record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save File Record": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "8d389e71-eef0-4c01-849d-b365509bb6c7",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "db57106b4a771a7fbc5e46a5ac3db767f46156e00ecd689ae3528d3bb11bcb19"
+  },
+  "id": "W7WLooYGZagBt7Xr",
+  "tags": []
+}

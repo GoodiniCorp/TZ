@@ -1,0 +1,66 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: tz-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: testpass
+      POSTGRES_DB: tz_test
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - tz_pg_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: tz-n8n
+    ports:
+      - "127.0.0.1:5678:5678"
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: tz_test
+      DB_POSTGRESDB_USER: postgres
+      DB_POSTGRESDB_PASSWORD: testpass
+      N8N_ENCRYPTION_KEY: tz_encryption_key_change_me
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      WEBHOOK_URL: http://localhost:5678/
+      NODE_FUNCTION_ALLOW_EXTERNAL: bcryptjs
+      GENERIC_TIMEZONE: Europe/Moscow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - tz_n8n_data:/home/node/.n8n
+
+  minio:
+    image: minio/minio:latest
+    container_name: tz-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - tz_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  tz_pg_data:
+  tz_n8n_data:
+  tz_minio_data:
